@@ -49,3 +49,9 @@
 - Emit `healthy=false` when any check fails.
 - Include specific remediation hints in output.
 - Recommend `sandbox init --location <location> --recreate` for unrecoverable drift.
+
+## Known Azure Timing Behavior
+
+- New service principals and fresh RBAC assignments can take time to propagate.
+- During propagation, login may fail with messages like `No subscriptions found`.
+- `sandbox init` should retry sandbox service-principal login with backoff before concluding failure.

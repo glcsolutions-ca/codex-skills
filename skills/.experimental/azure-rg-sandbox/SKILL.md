@@ -30,10 +30,13 @@ The boundary is one resource group plus one service principal that has `Owner` o
 ## Permission Bootstrap (Codex Runtime)
 
 - If Codex is running in a sandboxed mode that requires approval for networked commands, bootstrap one persistent rule before normal use.
-- For the first sandbox Azure command, request escalated execution and set prefix rule to:
+- Before bootstrap, check the current approved prefix list from the runtime permissions context.
+- If the prefix is not already approved, run a harmless scoped command first (`sandbox az account show -o none`) and request escalated execution with prefix rule:
   - `["<absolute-path-to-sandbox-script>", "az"]`
 - Use the absolute script path inside the installed skill directory (for example, `$CODEX_HOME/skills/azure-rg-sandbox/scripts/sandbox`).
-- After the user approves the prefix, continue using `sandbox az ...` for all Azure operations.
+- In the approval UI, select the persistent approval option so future `sandbox az ...` commands do not prompt again.
+- Until the prefix is confirmed as approved, keep including the same `prefix_rule` on escalated `sandbox az ...` requests.
+- After the prefix is approved, run `sandbox az ...` without forcing explicit escalation metadata.
 - Do not bypass this skill by switching to raw `az` commands just to avoid approval prompts.
 
 ## Command Contract
@@ -74,4 +77,4 @@ The boundary is one resource group plus one service principal that has `Owner` o
 - If `status` reports drift or missing bindings, run `init --recreate`.
 - Keep one subscription binding per workspace.
 - Do not share state files between workspaces.
-- If persistent prefix approval is unavailable, each `sandbox az` call may require explicit approval in restricted runtimes.
+- In restricted runtimes, `sandbox init`, `sandbox status`, and `sandbox destroy` may still require approval unless separately approved by policy.

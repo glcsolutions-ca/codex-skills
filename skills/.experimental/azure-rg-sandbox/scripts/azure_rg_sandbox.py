@@ -15,6 +15,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -24,6 +25,10 @@ SANDBOX_DIR_REL = Path(".codex/azure-rg-sandbox")
 STATE_FILE_NAME = "state.json"
 AZURE_CONFIG_DIR_NAME = "azure-config"
 GITIGNORE_LINE = ".codex/azure-rg-sandbox/"
+LOGIN_RETRY_ATTEMPTS = 8
+LOGIN_RETRY_INITIAL_DELAY_SECONDS = 5
+LOGIN_RETRY_MAX_DELAY_SECONDS = 30
+SENSITIVE_FLAGS = {"--password", "-p", "--client-secret", "--secret"}
 
 REQUIRED_STATE_FIELDS = {
     "version": int,
@@ -66,6 +71,49 @@ class WorkspacePaths:
     state_file: Path
     azure_config_dir: Path
     gitignore_file: Path
+
+
+def redact_command_for_logs(cmd: list[str]) -> str:
+    redacted: list[str] = []
+    redact_next = False
+
+    for token in cmd:
+        token_lower = token.lower()
+
+        if redact_next:
+            redacted.append("***REDACTED***")
+            redact_next = False
+            continue
+
+        if token_lower in SENSITIVE_FLAGS:
+            redacted.append(token)
+            redact_next = True
+            continue
+
+        if "=" in token:
+            key, _value = token.split("=", 1)
+            if key.lower() in SENSITIVE_FLAGS:
+                redacted.append(f"{key}=***REDACTED***")
+                continue
+
+        redacted.append(token)
+
+    return " ".join(redacted)
+
+
+def looks_like_role_propagation_delay(message: str) -> bool:
+    lower = message.lower()
+    return any(
+        snippet in lower
+        for snippet in (
+            "no subscriptions found for",
+            "does not have subscriptions",
+            "principal does not exist in directory",
+            "unable to find user or service principal",
+            "insufficient privileges to complete the operation",
+            "role assignment",
+        )
+    )
 
 
 def now_utc_iso() -> str:
@@ -290,41 +338,54 @@ def ensure_sandbox_login(state: dict[str, Any], paths: WorkspacePaths) -> tuple[
     except (CommandError, CliError):
         pass
 
-    run_az(
-        [
-            "login",
-            "--service-principal",
-            "--username",
-            state["service_principal_app_id"],
-            "--password",
-            state["service_principal_client_secret"],
-            "--tenant",
-            state["tenant_id"],
-            "--output",
-            "none",
-        ],
-        azure_config_dir=paths.azure_config_dir,
-        check=True,
-        capture_output=True,
-    )
-    run_az(
-        ["account", "set", "--subscription", expected_sub],
-        azure_config_dir=paths.azure_config_dir,
-        check=True,
-        capture_output=True,
-    )
+    delay_seconds = LOGIN_RETRY_INITIAL_DELAY_SECONDS
+    for attempt in range(1, LOGIN_RETRY_ATTEMPTS + 1):
+        try:
+            run_az(
+                [
+                    "login",
+                    "--service-principal",
+                    "--username",
+                    state["service_principal_app_id"],
+                    "--password",
+                    state["service_principal_client_secret"],
+                    "--tenant",
+                    state["tenant_id"],
+                    "--output",
+                    "none",
+                ],
+                azure_config_dir=paths.azure_config_dir,
+                check=True,
+                capture_output=True,
+            )
+            run_az(
+                ["account", "set", "--subscription", expected_sub],
+                azure_config_dir=paths.azure_config_dir,
+                check=True,
+                capture_output=True,
+            )
 
-    account_after = az_json(
-        ["account", "show", "--output", "json"],
-        azure_config_dir=paths.azure_config_dir,
-    )
-    if str(account_after.get("id", "")).lower() != expected_sub.lower():
-        raise CliError(
-            "Service principal login succeeded, but Azure CLI is not on the expected subscription "
-            f"'{expected_sub}'."
-        )
+            account_after = az_json(
+                ["account", "show", "--output", "json"],
+                azure_config_dir=paths.azure_config_dir,
+            )
+            if str(account_after.get("id", "")).lower() != expected_sub.lower():
+                raise CliError(
+                    "Service principal login succeeded, but Azure CLI is not on the expected subscription "
+                    f"'{expected_sub}'."
+                )
 
-    return True, "re-authenticated"
+            if attempt == 1:
+                return True, "re-authenticated"
+            return True, f"re-authenticated after {attempt} attempts"
+        except (CommandError, CliError) as exc:
+            message = str(exc)
+            if attempt >= LOGIN_RETRY_ATTEMPTS or not looks_like_role_propagation_delay(message):
+                raise
+            time.sleep(delay_seconds)
+            delay_seconds = min(delay_seconds * 2, LOGIN_RETRY_MAX_DELAY_SECONDS)
+
+    raise CliError("Failed to authenticate sandbox service principal after retries.")
 
 
 def resolve_subscription_and_tenant(subscription_arg: str | None) -> tuple[str, str]:
@@ -1023,7 +1084,7 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     except CommandError as exc:
-        cmd_text = " ".join(exc.cmd)
+        cmd_text = redact_command_for_logs(exc.cmd)
         details = exc.stderr.strip() or exc.stdout.strip() or str(exc)
         print(f"ERROR: Command failed: {cmd_text}\n{details}", file=sys.stderr)
         return exc.returncode or 1
