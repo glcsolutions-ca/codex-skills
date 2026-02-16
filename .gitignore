@@ -6,4 +6,4 @@ __pycache__/
 *.pyc
 
 # Azure sandbox local state
-.codex/azure-rg-sandbox/
+.sandbox/azure/

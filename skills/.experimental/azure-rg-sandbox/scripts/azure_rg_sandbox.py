@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,14 +23,15 @@ from typing import Any
 
 SKILL_NAME = "azure-rg-sandbox"
 STATE_VERSION = 1
-SANDBOX_DIR_REL = Path(".codex/azure-rg-sandbox")
+SANDBOX_DIR_REL = Path(".sandbox/azure")
 STATE_FILE_NAME = "state.json"
-AZURE_CONFIG_DIR_NAME = "azure-config"
+AZURE_CONFIG_DIR_NAME = "config"
 AZURE_CONFIG_FILE_NAME = "config"
 AZURE_COMMAND_LOG_DIR_NAME = "commands"
-GITIGNORE_LINE = ".codex/azure-rg-sandbox/"
-CODEX_RULES_DIR = Path.home() / ".codex" / "rules"
-CODEX_RULE_FILE_NAME = "azure-rg-sandbox.rules"
+RUNTIME_SANDBOX_SCRIPT_NAME = "sandbox"
+RUNTIME_AZ_SHIM_NAME = "az"
+GITIGNORE_LINE = ".sandbox/azure/"
+CODEX_NETWORK_DISABLED_ENV_VAR = "CODEX_SANDBOX_NETWORK_DISABLED"
 LOGIN_RETRY_ATTEMPTS = 8
 LOGIN_RETRY_INITIAL_DELAY_SECONDS = 5
 LOGIN_RETRY_MAX_DELAY_SECONDS = 30
@@ -76,7 +78,10 @@ class WorkspacePaths:
     sandbox_dir: Path
     state_file: Path
     azure_config_dir: Path
+    runtime_sandbox_script: Path
+    runtime_az_shim: Path
     gitignore_file: Path
+    codex_config_file: Path
 
 
 def redact_command_for_logs(cmd: list[str]) -> str:
@@ -138,15 +143,39 @@ def now_utc_iso() -> str:
     return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def resolve_workspace_root(cwd: Path | None = None) -> Path:
+    base = (cwd or Path.cwd()).resolve()
+    try:
+        process = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            cwd=base,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        process = None
+
+    if process and process.returncode == 0:
+        top = process.stdout.strip()
+        if top:
+            return Path(top).resolve()
+
+    return base
+
+
 def resolve_workspace_paths(workspace: Path | None = None) -> WorkspacePaths:
-    workspace_path = (workspace or Path.cwd()).resolve()
+    workspace_path = resolve_workspace_root(workspace)
     sandbox_dir = workspace_path / SANDBOX_DIR_REL
     return WorkspacePaths(
         workspace=workspace_path,
         sandbox_dir=sandbox_dir,
         state_file=sandbox_dir / STATE_FILE_NAME,
         azure_config_dir=sandbox_dir / AZURE_CONFIG_DIR_NAME,
+        runtime_sandbox_script=sandbox_dir / RUNTIME_SANDBOX_SCRIPT_NAME,
+        runtime_az_shim=sandbox_dir / RUNTIME_AZ_SHIM_NAME,
         gitignore_file=workspace_path / ".gitignore",
+        codex_config_file=workspace_path / ".codex" / "config.toml",
     )
 
 
@@ -154,6 +183,111 @@ def config_value_is_false(value: str | None) -> bool:
     if value is None:
         return False
     return value.strip().lower() in CONFIG_FALSE_VALUES
+
+
+def ensure_directory(path: Path, mode: int) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, mode)
+
+
+def write_executable(path: Path, content: str) -> None:
+    temp_file = path.with_suffix(".tmp")
+    temp_file.write_text(content, encoding="utf-8")
+    os.chmod(temp_file, 0o755)
+    temp_file.replace(path)
+    os.chmod(path, 0o755)
+
+
+def ensure_workspace_runtime_shims(paths: WorkspacePaths) -> None:
+    ensure_directory(paths.sandbox_dir, 0o700)
+
+    python_script = shlex.quote(str(Path(__file__).resolve()))
+    sandbox_content = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        f"exec python3 {python_script} \"$@\"\n"
+    )
+    az_content = (
+        "#!/usr/bin/env bash\n"
+        "set -euo pipefail\n\n"
+        "SCRIPT_DIR=\"$(cd \"$(dirname \"${BASH_SOURCE[0]}\")\" && pwd)\"\n"
+        "exec \"$SCRIPT_DIR/sandbox\" az \"$@\"\n"
+    )
+
+    write_executable(paths.runtime_sandbox_script, sandbox_content)
+    write_executable(paths.runtime_az_shim, az_content)
+
+
+def ensure_workspace_network_access_setting(config_file: Path) -> bool:
+    content = config_file.read_text(encoding="utf-8") if config_file.exists() else ""
+
+    section_pattern = re.compile(
+        r"(?ms)^\[sandbox_workspace_write\]\s*\n(?P<body>(?:^(?!\[).*(?:\n|$))*)"
+    )
+    setting_pattern = re.compile(r"(?m)^\s*network_access\s*=\s*([^\n#]+)(?:#.*)?$")
+
+    changed = False
+
+    if section_pattern.search(content):
+        match = section_pattern.search(content)
+        assert match is not None
+        body = match.group("body")
+        body_start = match.start("body")
+        body_end = match.end("body")
+
+        setting_match = setting_pattern.search(body)
+        if setting_match:
+            current = setting_match.group(1).strip().lower()
+            if current != "true":
+                body = setting_pattern.sub("network_access = true", body, count=1)
+                changed = True
+        else:
+            if body and not body.endswith("\n"):
+                body += "\n"
+            body += "network_access = true\n"
+            changed = True
+
+        if changed:
+            content = content[:body_start] + body + content[body_end:]
+    else:
+        if content and not content.endswith("\n"):
+            content += "\n"
+        if content and not content.endswith("\n\n"):
+            content += "\n"
+        content += "[sandbox_workspace_write]\nnetwork_access = true\n"
+        changed = True
+
+    if not changed:
+        return False
+
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_file = config_file.with_suffix(".tmp")
+    temp_file.write_text(content, encoding="utf-8")
+    os.chmod(temp_file, 0o600)
+    temp_file.replace(config_file)
+    os.chmod(config_file, 0o600)
+    return True
+
+
+def ensure_workspace_network_enabled(paths: WorkspacePaths) -> None:
+    if not os.environ.get(CODEX_NETWORK_DISABLED_ENV_VAR):
+        return
+
+    changed = ensure_workspace_network_access_setting(paths.codex_config_file)
+    snippet = "[sandbox_workspace_write]\nnetwork_access = true"
+
+    if changed:
+        raise CliError(
+            "Codex sandbox network is disabled for this session. Updated "
+            f"{paths.codex_config_file} with:\n\n{snippet}\n\n"
+            "Restart Codex in this workspace and rerun the same sandbox command."
+        )
+
+    raise CliError(
+        "Codex sandbox network is disabled for this session. Workspace config already contains "
+        f"network access settings at {paths.codex_config_file}.\n"
+        "Restart Codex in this workspace and rerun the same sandbox command."
+    )
 
 
 def ensure_azure_cli_local_config(azure_config_dir: Path) -> None:
@@ -276,11 +410,6 @@ def default_resource_group_name(slug: str, digest: str) -> str:
     return f"{prefix}-{trimmed_slug}-{digest}"[:90].rstrip("-")
 
 
-def ensure_directory(path: Path, mode: int) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    os.chmod(path, mode)
-
-
 def ensure_gitignore_line(paths: WorkspacePaths) -> bool:
     line = GITIGNORE_LINE
     if paths.gitignore_file.exists():
@@ -305,41 +434,6 @@ def gitignore_has_line(paths: WorkspacePaths) -> bool:
     return GITIGNORE_LINE in paths.gitignore_file.read_text().splitlines()
 
 
-def managed_codex_rule_path() -> Path:
-    return CODEX_RULES_DIR / CODEX_RULE_FILE_NAME
-
-
-def sandbox_wrapper_path() -> Path:
-    return Path(__file__).resolve().with_name("sandbox")
-
-
-def managed_codex_rule_content(wrapper_path: Path | None = None) -> str:
-    wrapper = wrapper_path or sandbox_wrapper_path()
-    wrapper_literal = json.dumps(str(wrapper))
-    return f'prefix_rule(pattern=[{wrapper_literal}], decision="allow")\n'
-
-
-def ensure_managed_codex_rule_file() -> tuple[bool, Path]:
-    rule_path = managed_codex_rule_path()
-    desired_content = managed_codex_rule_content()
-    try:
-        rule_path.parent.mkdir(parents=True, exist_ok=True)
-        if rule_path.exists() and rule_path.read_text(encoding="utf-8") == desired_content:
-            return False, rule_path
-        rule_path.write_text(desired_content, encoding="utf-8")
-    except OSError as exc:
-        raise CliError(f"Failed to maintain Codex rule file at '{rule_path}': {exc}") from exc
-    return True, rule_path
-
-
-def emit_codex_rule_activation_notice(rule_path: Path) -> None:
-    print(
-        "NOTE: Updated Codex rule file at "
-        f"{rule_path}. Restart Codex for prompt-free sandbox approvals to fully apply.",
-        file=sys.stderr,
-    )
-
-
 def parse_az_init_args(raw_args: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="sandbox az init",
@@ -358,6 +452,35 @@ def parse_az_init_args(raw_args: list[str]) -> argparse.Namespace:
             "Unsupported arguments for 'sandbox az init': "
             f"{joined}. Use 'sandbox az init --location <location> [--subscription <id>] "
             "[--resource-group <name>] [--recreate] [--json]'."
+        )
+    return parsed
+
+
+def parse_az_status_args(raw_args: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="sandbox az status", add_help=False)
+    parser.add_argument("--json", action="store_true")
+
+    parsed, unknown = parser.parse_known_args(raw_args)
+    if unknown:
+        joined = " ".join(unknown)
+        raise CliError(
+            "Unsupported arguments for 'sandbox az status': "
+            f"{joined}. Use 'sandbox az status [--json]'."
+        )
+    return parsed
+
+
+def parse_az_destroy_args(raw_args: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="sandbox az destroy", add_help=False)
+    parser.add_argument("--yes", action="store_true")
+    parser.add_argument("--json", action="store_true")
+
+    parsed, unknown = parser.parse_known_args(raw_args)
+    if unknown:
+        joined = " ".join(unknown)
+        raise CliError(
+            "Unsupported arguments for 'sandbox az destroy': "
+            f"{joined}. Use 'sandbox az destroy --yes [--json]'."
         )
     return parsed
 
@@ -461,7 +584,10 @@ def ensure_sandbox_login(state: dict[str, Any], paths: WorkspacePaths) -> tuple[
     expected_sub = state["subscription_id"]
 
     try:
-        account = az_json(["account", "show", "--output", "json"], azure_config_dir=paths.azure_config_dir)
+        account = az_json(
+            ["account", "show", "--output", "json"],
+            azure_config_dir=paths.azure_config_dir,
+        )
         if str(account.get("id", "")).lower() == expected_sub.lower():
             return True, "already authenticated"
     except (CommandError, CliError):
@@ -517,7 +643,7 @@ def ensure_sandbox_login(state: dict[str, Any], paths: WorkspacePaths) -> tuple[
     raise CliError("Failed to authenticate sandbox service principal after retries.")
 
 
-def reset_service_principal_secret(app_id: str) -> tuple[str, str]:
+def reset_service_principal_secret(app_id: str, *, azure_config_dir: Path) -> tuple[str, str]:
     payload = az_json(
         [
             "ad",
@@ -529,7 +655,8 @@ def reset_service_principal_secret(app_id: str) -> tuple[str, str]:
             "--append",
             "--output",
             "json",
-        ]
+        ],
+        azure_config_dir=azure_config_dir,
     )
 
     secret = str(payload.get("password", "")).strip()
@@ -541,11 +668,25 @@ def reset_service_principal_secret(app_id: str) -> tuple[str, str]:
     return secret, tenant
 
 
-def resolve_subscription_and_tenant(subscription_arg: str | None) -> tuple[str, str]:
+def resolve_subscription_and_tenant(
+    subscription_arg: str | None,
+    *,
+    azure_config_dir: Path,
+) -> tuple[str, str]:
     args = ["account", "show", "--output", "json"]
     if subscription_arg:
         args.extend(["--subscription", subscription_arg])
-    account = az_json(args)
+
+    try:
+        account = az_json(args, azure_config_dir=azure_config_dir)
+    except CommandError as exc:
+        details = exc.stderr.strip() or exc.stdout.strip() or str(exc)
+        raise CliError(
+            "Azure operator account is not authenticated in workspace config. "
+            f"Run: AZURE_CONFIG_DIR={azure_config_dir} az login\n"
+            "Then rerun: sandbox az init --location <location>\n\n"
+            f"Azure CLI output: {details}"
+        ) from exc
 
     subscription_id = str(account.get("id", "")).strip()
     tenant_id = str(account.get("tenantId", "")).strip()
@@ -687,7 +828,8 @@ def check_health(
                 state["subscription_id"],
                 "--output",
                 "tsv",
-            ]
+            ],
+            azure_config_dir=paths.azure_config_dir,
         )
         rg_exists = exists.strip().lower() == "true"
         add_check(
@@ -717,7 +859,8 @@ def check_health(
                 "id",
                 "--output",
                 "tsv",
-            ]
+            ],
+            azure_config_dir=paths.azure_config_dir,
         )
         sp_exists = bool(sp_id)
         add_check(
@@ -754,7 +897,8 @@ def check_health(
                     "false",
                     "--output",
                     "json",
-                ]
+                ],
+                azure_config_dir=paths.azure_config_dir,
             )
             owner_assignment_ok = isinstance(owner_assignments, list) and len(owner_assignments) > 0
             add_check(
@@ -794,7 +938,8 @@ def check_health(
                     "false",
                     "--output",
                     "json",
-                ]
+                ],
+                azure_config_dir=paths.azure_config_dir,
             )
             outside = []
             expected_scope = state["resource_group_scope"].lower()
@@ -831,7 +976,10 @@ def check_health(
     auth_ok = False
     auth_detail = ""
     try:
-        account = az_json(["account", "show", "--output", "json"], azure_config_dir=paths.azure_config_dir)
+        account = az_json(
+            ["account", "show", "--output", "json"],
+            azure_config_dir=paths.azure_config_dir,
+        )
         auth_ok = str(account.get("id", "")).lower() == state["subscription_id"].lower()
         auth_detail = f"Sandbox AZURE_CONFIG_DIR account id={account.get('id', '')}."
     except (CommandError, CliError) as exc:
@@ -857,7 +1005,7 @@ def check_health(
         "gitignore-protection",
         ignore_ok,
         f"{paths.gitignore_file} contains '{GITIGNORE_LINE}'={ignore_ok}.",
-        "Add '.codex/azure-rg-sandbox/' to workspace .gitignore.",
+        "Add '.sandbox/azure/' to workspace .gitignore.",
     )
 
     healthy = all(check["ok"] for check in checks)
@@ -890,7 +1038,8 @@ def destroy_boundary(
             "--subscription",
             state["subscription_id"],
             "--yes",
-        ]
+        ],
+        azure_config_dir=paths.azure_config_dir,
     )
     operations.append({"step": "delete-resource-group", "ok": rg_ok, "details": rg_detail})
 
@@ -907,14 +1056,21 @@ def destroy_boundary(
             state["resource_group_scope"],
             "--subscription",
             state["subscription_id"],
-        ]
+        ],
+        azure_config_dir=paths.azure_config_dir,
     )
     operations.append({"step": "delete-role-assignment", "ok": assignment_ok, "details": assignment_detail})
 
-    sp_ok, sp_detail = best_effort_az(["ad", "sp", "delete", "--id", state["service_principal_app_id"]])
+    sp_ok, sp_detail = best_effort_az(
+        ["ad", "sp", "delete", "--id", state["service_principal_app_id"]],
+        azure_config_dir=paths.azure_config_dir,
+    )
     operations.append({"step": "delete-service-principal", "ok": sp_ok, "details": sp_detail})
 
-    app_ok, app_detail = best_effort_az(["ad", "app", "delete", "--id", state["service_principal_app_id"]])
+    app_ok, app_detail = best_effort_az(
+        ["ad", "app", "delete", "--id", state["service_principal_app_id"]],
+        azure_config_dir=paths.azure_config_dir,
+    )
     operations.append({"step": "delete-application", "ok": app_ok, "details": app_detail})
 
     if paths.sandbox_dir.exists():
@@ -929,7 +1085,9 @@ def cmd_init(args: argparse.Namespace) -> int:
         raise CliError("sandbox az init requires --location <azure-location>.")
 
     paths = resolve_workspace_paths()
+    ensure_workspace_network_enabled(paths)
     ensure_directory(paths.sandbox_dir, 0o700)
+    ensure_workspace_runtime_shims(paths)
 
     if paths.state_file.exists():
         existing_state = load_state(paths)
@@ -947,15 +1105,16 @@ def cmd_init(args: argparse.Namespace) -> int:
         else:
             report = check_health(paths, existing_state, allow_relogin=True)
             if report["healthy"]:
-                rules_updated, rule_path = ensure_managed_codex_rule_file()
-                if rules_updated:
-                    emit_codex_rule_activation_notice(rule_path)
+                ensure_workspace_runtime_shims(paths)
                 payload = {
                     "status": "already-initialized",
                     "workspace": str(paths.workspace),
                     "resource_group_name": existing_state["resource_group_name"],
                     "subscription_id": existing_state["subscription_id"],
-                    "codex_rule_file": str(rule_path),
+                    "state_file": str(paths.state_file),
+                    "azure_config_dir": str(paths.azure_config_dir),
+                    "sandbox_entrypoint": str(paths.runtime_sandbox_script),
+                    "az_shim": str(paths.runtime_az_shim),
                 }
                 if args.json:
                     print(json.dumps(payload, indent=2, sort_keys=True))
@@ -964,7 +1123,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                         "Sandbox is already initialized and healthy "
                         f"for resource group '{existing_state['resource_group_name']}'."
                     )
-                    print(f"- codex rule file: {rule_path}")
+                    print(f"- state file: {paths.state_file}")
+                    print(f"- azure config dir: {paths.azure_config_dir}")
+                    print(f"- sandbox entrypoint: {paths.runtime_sandbox_script}")
+                    print(f"- az shim: {paths.runtime_az_shim}")
                 return 0
 
             if args.json:
@@ -975,7 +1137,10 @@ def cmd_init(args: argparse.Namespace) -> int:
                 print("Re-run with --recreate to destroy and reinitialize the sandbox boundary.")
             return 1
 
-    subscription_id, tenant_id = resolve_subscription_and_tenant(args.subscription)
+    subscription_id, tenant_id = resolve_subscription_and_tenant(
+        args.subscription,
+        azure_config_dir=paths.azure_config_dir,
+    )
 
     slug, digest, workspace_id = workspace_id_for(paths.workspace)
     resource_group = args.resource_group or default_resource_group_name(slug, digest)
@@ -999,6 +1164,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "--output",
             "none",
         ],
+        azure_config_dir=paths.azure_config_dir,
         check=True,
         capture_output=True,
     )
@@ -1018,7 +1184,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             "1",
             "--output",
             "json",
-        ]
+        ],
+        azure_config_dir=paths.azure_config_dir,
     )
 
     app_id = str(create_payload.get("appId", "")).strip()
@@ -1045,7 +1212,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             "id",
             "--output",
             "tsv",
-        ]
+        ],
+        azure_config_dir=paths.azure_config_dir,
     )
     if not sp_object_id:
         raise CliError("Failed to resolve service principal object id after creation.")
@@ -1075,7 +1243,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         if not looks_like_invalid_client_secret(str(exc)):
             raise
 
-        rotated_secret, tenant_from_reset = reset_service_principal_secret(app_id)
+        rotated_secret, tenant_from_reset = reset_service_principal_secret(
+            app_id,
+            azure_config_dir=paths.azure_config_dir,
+        )
         state["service_principal_client_secret"] = rotated_secret
         if tenant_from_reset:
             state["tenant_id"] = tenant_from_reset
@@ -1084,9 +1255,7 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     write_state(paths, state)
     ensure_gitignore_line(paths)
-    rules_updated, rule_path = ensure_managed_codex_rule_file()
-    if rules_updated:
-        emit_codex_rule_activation_notice(rule_path)
+    ensure_workspace_runtime_shims(paths)
 
     payload = {
         "status": "initialized",
@@ -1098,7 +1267,8 @@ def cmd_init(args: argparse.Namespace) -> int:
         "service_principal_app_id": app_id,
         "state_file": str(paths.state_file),
         "azure_config_dir": str(paths.azure_config_dir),
-        "codex_rule_file": str(rule_path),
+        "sandbox_entrypoint": str(paths.runtime_sandbox_script),
+        "az_shim": str(paths.runtime_az_shim),
     }
 
     if args.json:
@@ -1109,29 +1279,11 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"- scope: {scope}")
         print(f"- service principal app id: {app_id}")
         print(f"- state file: {paths.state_file}")
-        print(f"- codex rule file: {rule_path}")
+        print(f"- azure config dir: {paths.azure_config_dir}")
+        print(f"- sandbox entrypoint: {paths.runtime_sandbox_script}")
+        print(f"- az shim: {paths.runtime_az_shim}")
 
     return 0
-
-
-def cmd_az(args: argparse.Namespace) -> int:
-    if not args.az_args:
-        raise CliError("Usage: sandbox az <azure-cli-args...>")
-
-    if args.az_args[0] == "init":
-        init_alias_args = parse_az_init_args(args.az_args[1:])
-        return cmd_init(init_alias_args)
-
-    paths = resolve_workspace_paths()
-    state = load_state(paths)
-
-    enforce_guardrails(args.az_args, state)
-    ensure_sandbox_login(state, paths)
-
-    env = az_env(paths.azure_config_dir)
-
-    result = subprocess.run(["az", *args.az_args], env=env)
-    return result.returncode
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -1179,6 +1331,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             print_status_report(report)
         return 1
 
+    ensure_workspace_network_enabled(paths)
     report = check_health(paths, state, allow_relogin=True)
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True))
@@ -1195,6 +1348,7 @@ def cmd_destroy(args: argparse.Namespace) -> int:
     paths = resolve_workspace_paths()
     state = load_state(paths)
 
+    ensure_workspace_network_enabled(paths)
     result = destroy_boundary(state, paths)
 
     payload = {
@@ -1216,6 +1370,39 @@ def cmd_destroy(args: argparse.Namespace) -> int:
     return 0 if result["healthy"] else 1
 
 
+def cmd_az(args: argparse.Namespace) -> int:
+    if not args.az_args:
+        raise CliError("Usage: sandbox az <azure-cli-args...>")
+
+    az_args = list(args.az_args)
+    force_passthrough = False
+
+    if az_args and az_args[0] == "--":
+        force_passthrough = True
+        az_args = az_args[1:]
+        if not az_args:
+            raise CliError("Usage: sandbox az -- <azure-cli-args...>")
+
+    if not force_passthrough:
+        if az_args[0] == "init":
+            return cmd_init(parse_az_init_args(az_args[1:]))
+        if az_args[0] == "status":
+            return cmd_status(parse_az_status_args(az_args[1:]))
+        if az_args[0] == "destroy":
+            return cmd_destroy(parse_az_destroy_args(az_args[1:]))
+
+    paths = resolve_workspace_paths()
+    state = load_state(paths)
+
+    ensure_workspace_network_enabled(paths)
+    enforce_guardrails(az_args, state)
+    ensure_sandbox_login(state, paths)
+
+    env = az_env(paths.azure_config_dir)
+    result = subprocess.run(["az", *az_args], env=env)
+    return result.returncode
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sandbox",
@@ -1226,36 +1413,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     az_parser = subparsers.add_parser(
         "az",
-        help="Run az commands through sandbox guardrails. Use 'sandbox az init ...' for sandbox setup.",
+        help="Run az commands and sandbox lifecycle operations (init/status/destroy).",
     )
     az_parser.add_argument(
         "az_args",
         nargs=argparse.REMAINDER,
-        help="Arguments passed to az. Special case: 'init' sets up sandbox state.",
+        help="Arguments passed to az. Reserved lifecycle subcommands: init, status, destroy.",
     )
     az_parser.set_defaults(func=cmd_az)
-
-    status_parser = subparsers.add_parser("status", help="Report sandbox health and drift checks.")
-    status_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
-    status_parser.set_defaults(func=cmd_status)
-
-    destroy_parser = subparsers.add_parser("destroy", help="Tear down sandbox resources and local state.")
-    destroy_parser.add_argument("--yes", action="store_true", help="Confirm destructive teardown.")
-    destroy_parser.add_argument("--json", action="store_true", help="Emit JSON output.")
-    destroy_parser.set_defaults(func=cmd_destroy)
 
     return parser
 
 
 def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    # argparse.REMAINDER keeps a leading '--' separator; drop it for passthrough.
-    if getattr(args, "az_args", None) and args.az_args and args.az_args[0] == "--":
-        args.az_args = args.az_args[1:]
-
+    argv = sys.argv[1:]
     try:
+        if argv and argv[0] in {"init", "status", "destroy"}:
+            raise CliError(f"Use 'sandbox az {argv[0]}' instead of 'sandbox {argv[0]}'.")
+
+        parser = build_parser()
+        args = parser.parse_args(argv)
         return args.func(args)
     except CliError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

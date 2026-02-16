@@ -1,31 +1,18 @@
 ---
 name: azure-rg-sandbox
-description: Use this skill when Codex needs safe Azure CLI execution scoped to one workspace sandbox resource group. Primary workflow is `sandbox az ...`, with one-time bootstrap via `sandbox az init --location LOCATION`, plus health checks (`sandbox status`) and teardown (`sandbox destroy --yes`).
+description: Use this skill for safe Azure CLI work scoped to one workspace sandbox resource group. Use `sandbox az ...` for all operations.
 ---
 
-# Azure RG Sandbox
+Use `sandbox az ...` for Azure operations in this workspace.
 
-Use `sandbox az ...` for all Azure operations.
-
-If sandbox state is missing in this workspace, run:
+If the sandbox is not initialized, run once:
 - `sandbox az init --location <azure-location>`
 
-Then retry the same `sandbox az ...` command.
-
-## Commands
-
+Commands:
 - `sandbox az init --location <azure-location> [--subscription <id>] [--resource-group <name>] [--recreate] [--json]`
-  - Initializes or recreates the workspace sandbox boundary.
+- `sandbox az status [--json]`
+- `sandbox az destroy --yes [--json]`
 - `sandbox az <azure-cli-args...>`
-  - Runs scoped Azure CLI commands using sandbox auth.
-  - Never auto-initializes; if state is missing, it tells you to run `sandbox az init --location <location>` first.
-- `sandbox status [--json]`
-  - Reports sandbox health and drift.
-- `sandbox destroy --yes [--json]`
-  - Tears down sandbox resources and local sandbox state.
+- `sandbox az -- <azure-cli-args...>`
 
-## Notes
-
-- State file is workspace-local: `.codex/azure-rg-sandbox/state.json`.
-- `sandbox az init` maintains `~/.codex/rules/azure-rg-sandbox.rules` and does not modify `~/.codex/rules/default.rules`.
-- If that rules file changes, restart Codex to fully apply prompt-free behavior.
+Runtime files are workspace-local under `.sandbox/azure/`.
