@@ -27,6 +27,15 @@ The boundary is one resource group plus one service principal that has `Owner` o
 4. Destroy boundary when done:
    - `./skills/.experimental/azure-rg-sandbox/scripts/sandbox destroy --yes`
 
+## Permission Bootstrap (Codex Runtime)
+
+- If Codex is running in a sandboxed mode that requires approval for networked commands, bootstrap one persistent rule before normal use.
+- For the first sandbox Azure command, request escalated execution and set prefix rule to:
+  - `["<absolute-path-to-sandbox-script>", "az"]`
+- Use the absolute script path inside the installed skill directory (for example, `$CODEX_HOME/skills/azure-rg-sandbox/scripts/sandbox`).
+- After the user approves the prefix, continue using `sandbox az ...` for all Azure operations.
+- Do not bypass this skill by switching to raw `az` commands just to avoid approval prompts.
+
 ## Command Contract
 
 - `sandbox init --location <azure-location> [--subscription <id>] [--resource-group <name>] [--recreate] [--json]`
@@ -65,3 +74,4 @@ The boundary is one resource group plus one service principal that has `Owner` o
 - If `status` reports drift or missing bindings, run `init --recreate`.
 - Keep one subscription binding per workspace.
 - Do not share state files between workspaces.
+- If persistent prefix approval is unavailable, each `sandbox az` call may require explicit approval in restricted runtimes.
