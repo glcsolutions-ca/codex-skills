@@ -1,4 +1,0 @@
-interface:
-  display_name: "Azure RG Sandbox"
-  short_description: "Scoped Azure CLI sandbox per workspace"
-  default_prompt: "Use $azure-rg-sandbox to initialize a workspace Azure sandbox and run scoped az commands."

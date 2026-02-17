@@ -1,0 +1,4 @@
+interface:
+  display_name: "Azure Sandbox"
+  short_description: "Workspace-local Azure sandbox fleet"
+  default_prompt: "Use $azure-sandbox in az-first mode: run normal Azure CLI as `${CODEX_HOME:-$HOME/.codex}/skills/azure-sandbox/scripts/azs ...`."
